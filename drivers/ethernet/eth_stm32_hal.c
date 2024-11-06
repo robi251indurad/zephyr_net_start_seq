@@ -907,12 +907,134 @@ static void generate_mac(uint8_t *mac_addr)
 #endif
 }
 
+int hal_init(void)
+{
+	HAL_StatusTypeDef hal_ret = HAL_OK;
+	const struct device *const dev = DEVICE_DT_GET(DT_NODELABEL(mac));
+	struct eth_stm32_hal_dev_data *eth_dev_data = dev->data;
+	ETH_HandleTypeDef *heth = &eth_dev_data->heth;
+
+	heth = &eth_dev_data->heth;
+
+	generate_mac(eth_dev_data->mac_addr);
+
+	heth->Init.MACAddr = eth_dev_data->mac_addr;
+
+#if defined(CONFIG_SOC_SERIES_STM32H7X) || defined(CONFIG_SOC_SERIES_STM32H5X) ||                  \
+	defined(CONFIG_ETH_STM32_HAL_API_V2)
+	heth->Init.TxDesc = dma_tx_desc_tab;
+	heth->Init.RxDesc = dma_rx_desc_tab;
+	heth->Init.RxBuffLen = ETH_STM32_RX_BUF_SIZE;
+#endif /* CONFIG_SOC_SERIES_STM32H7X || CONFIG_SOC_SERIES_STM32H5X || CONFIG_ETH_STM32_HAL_API_V2  \
+	*/
+
+	hal_ret = HAL_ETH_Init(heth);
+	if (hal_ret == HAL_TIMEOUT) {
+		/* HAL Init time out. This could be linked to */
+		/* a recoverable error. Log the issue and continue */
+		/* driver initialisation */
+		LOG_ERR("HAL_ETH_Init Timed out");
+	} else if (hal_ret != HAL_OK) {
+		LOG_ERR("HAL_ETH_Init failed: %d", hal_ret);
+		return -EINVAL;
+	}
+
+#if defined(CONFIG_PTP_CLOCK_STM32_HAL)
+	/* Enable timestamping of RX packets. We enable all packets to be
+	 * timestamped to cover both IEEE 1588 and gPTP.
+	 */
+#if defined(CONFIG_SOC_SERIES_STM32H7X) || defined(CONFIG_SOC_SERIES_STM32H5X)
+	heth->Instance->MACTSCR |= ETH_MACTSCR_TSENALL;
+#else
+	heth->Instance->PTPTSCR |= ETH_PTPTSCR_TSSARFE;
+#endif /* CONFIG_SOC_SERIES_STM32H7X || CONFIG_SOC_SERIES_STM32H5X */
+#endif /* CONFIG_PTP_CLOCK_STM32_HAL */
+
+#if defined(CONFIG_SOC_SERIES_STM32H7X) || defined(CONFIG_SOC_SERIES_STM32H5X) ||                  \
+	defined(CONFIG_ETH_STM32_HAL_API_V2)
+	/* Tx config init: */
+	memset(&tx_config, 0, sizeof(ETH_TxPacketConfig));
+	tx_config.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;
+	tx_config.ChecksumCtrl = IS_ENABLED(CONFIG_ETH_STM32_HW_CHECKSUM)
+					 ? ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC
+					 : ETH_CHECKSUM_DISABLE;
+	tx_config.CRCPadCtrl = ETH_CRC_PAD_INSERT;
+#endif /* CONFIG_SOC_SERIES_STM32H7X || CONFIG_SOC_SERIES_STM32H5X || CONFIG_ETH_STM32_HAL_API_V2  \
+	*/
+
+	eth_dev_data->link_up = false;
+
+	/* Initialize semaphores */
+	k_mutex_init(&eth_dev_data->tx_mutex);
+	k_sem_init(&eth_dev_data->rx_int_sem, 0, K_SEM_MAX_LIMIT);
+#if defined(CONFIG_SOC_SERIES_STM32H7X) || defined(CONFIG_SOC_SERIES_STM32H5X) ||                  \
+	defined(CONFIG_ETH_STM32_HAL_API_V2)
+	k_sem_init(&eth_dev_data->tx_int_sem, 0, K_SEM_MAX_LIMIT);
+#endif /* CONFIG_SOC_SERIES_STM32H7X || CONFIG_SOC_SERIES_STM32H5X || CONFIG_ETH_STM32_HAL_API_V2  \
+	*/
+
+#if defined(CONFIG_SOC_SERIES_STM32H7X) || defined(CONFIG_SOC_SERIES_STM32H5X) ||                  \
+	defined(CONFIG_ETH_STM32_HAL_API_V2)
+	/* Adjust MDC clock range depending on HCLK frequency: */
+	HAL_ETH_SetMDIOClockRange(heth);
+
+	/* @TODO: read duplex mode and speed from PHY and set it to ETH */
+
+	ETH_MACConfigTypeDef mac_config;
+
+	HAL_ETH_GetMACConfig(heth, &mac_config);
+	mac_config.DuplexMode = IS_ENABLED(CONFIG_ETH_STM32_MODE_HALFDUPLEX) ? ETH_HALFDUPLEX_MODE
+									     : ETH_FULLDUPLEX_MODE;
+	mac_config.Speed = IS_ENABLED(CONFIG_ETH_STM32_SPEED_10M) ? ETH_SPEED_10M : ETH_SPEED_100M;
+	hal_ret = HAL_ETH_SetMACConfig(heth, &mac_config);
+	if (hal_ret != HAL_OK) {
+		LOG_ERR("HAL_ETH_SetMACConfig: failed: %d", hal_ret);
+	}
+#endif /* CONFIG_SOC_SERIES_STM32H7X || CONFIG_SOC_SERIES_STM32H5X || CONFIG_ETH_STM32_HAL_API_V2  \
+	*/
+
+#if defined(CONFIG_ETH_STM32_HAL_API_V2)
+
+	/* prepare tx buffer header */
+	for (uint16_t i = 0; i < ETH_TXBUFNB; ++i) {
+		dma_tx_buffer_header[i].tx_buff.buffer = dma_tx_buffer[i];
+	}
+
+	hal_ret = HAL_ETH_Start_IT(heth);
+#elif defined(CONFIG_SOC_SERIES_STM32H7X) || defined(CONFIG_SOC_SERIES_STM32H5X)
+	for (uint32_t i = 0; i < ETH_RX_DESC_CNT; i++) {
+		hal_ret = HAL_ETH_DescAssignMemory(heth, i, dma_rx_buffer[i], NULL);
+		if (hal_ret != HAL_OK) {
+			LOG_ERR("HAL_ETH_DescAssignMemory: failed: %d, i: %d", hal_ret, i);
+			return -EINVAL;
+		}
+	}
+
+	hal_ret = HAL_ETH_Start_IT(heth);
+#else
+	HAL_ETH_DMATxDescListInit(heth, dma_tx_desc_tab, &dma_tx_buffer[0][0], ETH_TXBUFNB);
+	HAL_ETH_DMARxDescListInit(heth, dma_rx_desc_tab, &dma_rx_buffer[0][0], ETH_RXBUFNB);
+
+	hal_ret = HAL_ETH_Start(heth);
+#endif /* CONFIG_ETH_STM32_HAL_API_V2 */
+
+	if (hal_ret != HAL_OK) {
+		LOG_ERR("HAL_ETH_Start{_IT} failed");
+	}
+
+	setup_mac_filter(heth);
+
+	LOG_DBG("MAC %02x:%02x:%02x:%02x:%02x:%02x", eth_dev_data->mac_addr[0],
+		eth_dev_data->mac_addr[1], eth_dev_data->mac_addr[2], eth_dev_data->mac_addr[3],
+		eth_dev_data->mac_addr[4], eth_dev_data->mac_addr[5]);
+}
+
+SYS_INIT(hal_init, POST_KERNEL, 89);
+
 static int eth_initialize(const struct device *dev)
 {
 	struct eth_stm32_hal_dev_data *dev_data;
 	const struct eth_stm32_hal_dev_cfg *cfg;
-	ETH_HandleTypeDef *heth;
-	HAL_StatusTypeDef hal_ret = HAL_OK;
 	int ret = 0;
 
 	__ASSERT_NO_MSG(dev != NULL);
@@ -931,15 +1053,11 @@ static int eth_initialize(const struct device *dev)
 	}
 
 	/* enable clock */
-	ret = clock_control_on(dev_data->clock,
-		(clock_control_subsys_t)&cfg->pclken);
-	ret |= clock_control_on(dev_data->clock,
-		(clock_control_subsys_t)&cfg->pclken_tx);
-	ret |= clock_control_on(dev_data->clock,
-		(clock_control_subsys_t)&cfg->pclken_rx);
+	ret = clock_control_on(dev_data->clock, (clock_control_subsys_t)&cfg->pclken);
+	ret |= clock_control_on(dev_data->clock, (clock_control_subsys_t)&cfg->pclken_tx);
+	ret |= clock_control_on(dev_data->clock, (clock_control_subsys_t)&cfg->pclken_rx);
 #if DT_INST_CLOCKS_HAS_NAME(0, mac_clk_ptp)
-	ret |= clock_control_on(dev_data->clock,
-		(clock_control_subsys_t)&cfg->pclken_ptp);
+	ret |= clock_control_on(dev_data->clock, (clock_control_subsys_t)&cfg->pclken_ptp);
 #endif
 
 	if (ret) {
@@ -953,108 +1071,6 @@ static int eth_initialize(const struct device *dev)
 		LOG_ERR("Could not configure ethernet pins");
 		return ret;
 	}
-
-	heth = &dev_data->heth;
-
-	generate_mac(dev_data->mac_addr);
-
-	heth->Init.MACAddr = dev_data->mac_addr;
-
-#if defined(CONFIG_ETH_STM32_HAL_API_V2)
-	heth->Init.TxDesc = dma_tx_desc_tab;
-	heth->Init.RxDesc = dma_rx_desc_tab;
-	heth->Init.RxBuffLen = ETH_MAX_PACKET_SIZE;
-#endif /* CONFIG_ETH_STM32_HAL_API_V2 */
-
-	hal_ret = HAL_ETH_Init(heth);
-	if (hal_ret == HAL_TIMEOUT) {
-		/* HAL Init time out. This could be linked to */
-		/* a recoverable error. Log the issue and continue */
-		/* driver initialisation */
-		LOG_ERR("HAL_ETH_Init Timed out");
-	} else if (hal_ret != HAL_OK) {
-		LOG_ERR("HAL_ETH_Init failed: %d", hal_ret);
-		return -EINVAL;
-	}
-
-#if defined(CONFIG_PTP_CLOCK_STM32_HAL)
-	/* Enable timestamping of RX packets. We enable all packets to be
-	 * timestamped to cover both IEEE 1588 and gPTP.
-	 */
-#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_ethernet)
-	heth->Instance->MACTSCR |= ETH_MACTSCR_TSENALL;
-#else
-	heth->Instance->PTPTSCR |= ETH_PTPTSCR_TSSARFE;
-#endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_ethernet) */
-#endif /* CONFIG_PTP_CLOCK_STM32_HAL */
-
-#if defined(CONFIG_ETH_STM32_HAL_API_V2)
-	/* Tx config init: */
-	memset(&tx_config, 0, sizeof(ETH_TxPacketConfig));
-	tx_config.Attributes = ETH_TX_PACKETS_FEATURES_CSUM |
-				ETH_TX_PACKETS_FEATURES_CRCPAD;
-	tx_config.ChecksumCtrl = IS_ENABLED(CONFIG_ETH_STM32_HW_CHECKSUM) ?
-			ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC : ETH_CHECKSUM_DISABLE;
-	tx_config.CRCPadCtrl = ETH_CRC_PAD_INSERT;
-#endif /* CONFIG_ETH_STM32_HAL_API_V2 */
-
-	dev_data->link_up = false;
-
-	/* Initialize semaphores */
-	k_mutex_init(&dev_data->tx_mutex);
-	k_sem_init(&dev_data->rx_int_sem, 0, K_SEM_MAX_LIMIT);
-#if defined(CONFIG_ETH_STM32_HAL_API_V2)
-	k_sem_init(&dev_data->tx_int_sem, 0, K_SEM_MAX_LIMIT);
-#endif /* CONFIG_ETH_STM32_HAL_API_V2 */
-
-#if defined(CONFIG_ETH_STM32_HAL_API_V2)
-	/* Adjust MDC clock range depending on HCLK frequency: */
-	HAL_ETH_SetMDIOClockRange(heth);
-
-	/* @TODO: read duplex mode and speed from PHY and set it to ETH */
-
-	ETH_MACConfigTypeDef mac_config;
-
-	HAL_ETH_GetMACConfig(heth, &mac_config);
-	mac_config.DuplexMode = IS_ENABLED(CONFIG_ETH_STM32_MODE_HALFDUPLEX) ?
-				      ETH_HALFDUPLEX_MODE : ETH_FULLDUPLEX_MODE;
-	mac_config.Speed = IS_ENABLED(CONFIG_ETH_STM32_SPEED_10M) ?
-				 ETH_SPEED_10M : ETH_SPEED_100M;
-	hal_ret = HAL_ETH_SetMACConfig(heth, &mac_config);
-	if (hal_ret != HAL_OK) {
-		LOG_ERR("HAL_ETH_SetMACConfig: failed: %d", hal_ret);
-	}
-#endif /* CONFIG_ETH_STM32_HAL_API_V2 */
-
-#if defined(CONFIG_ETH_STM32_HAL_API_V2)
-
-	/* prepare tx buffer header */
-	for (uint16_t i = 0; i < ETH_TX_DESC_CNT; ++i) {
-		dma_tx_buffer_header[i].tx_buff.buffer = dma_tx_buffer[i];
-	}
-
-	hal_ret = HAL_ETH_Start_IT(heth);
-#else
-	HAL_ETH_DMATxDescListInit(heth, dma_tx_desc_tab,
-		&dma_tx_buffer[0][0], ETH_TX_DESC_CNT);
-	HAL_ETH_DMARxDescListInit(heth, dma_rx_desc_tab,
-		&dma_rx_buffer[0][0], ETH_RX_DESC_CNT);
-
-	hal_ret = HAL_ETH_Start(heth);
-#endif /* CONFIG_ETH_STM32_HAL_API_V2 */
-
-	if (hal_ret != HAL_OK) {
-		LOG_ERR("HAL_ETH_Start{_IT} failed");
-	}
-
-	setup_mac_filter(heth);
-
-
-	LOG_DBG("MAC %02x:%02x:%02x:%02x:%02x:%02x",
-		dev_data->mac_addr[0], dev_data->mac_addr[1],
-		dev_data->mac_addr[2], dev_data->mac_addr[3],
-		dev_data->mac_addr[4], dev_data->mac_addr[5]);
-
 	return 0;
 }
 
@@ -1062,7 +1078,7 @@ static int eth_initialize(const struct device *dev)
 static void eth_stm32_mcast_filter(const struct device *dev, const struct ethernet_filter *filter)
 {
 	struct eth_stm32_hal_dev_data *dev_data = (struct eth_stm32_hal_dev_data *)dev->data;
-	ETH_HandleTypeDef *heth;
+    ETH_HandleTypeDef *heth;
 	uint32_t crc;
 	uint32_t hash_table[2];
 	uint32_t hash_index;
